@@ -1,0 +1,17 @@
+[project]
+name = "titans-mini"
+version = "0.1.0"
+description = "Modular Titans-style test-time memory: streaming engine + swappable memory cores"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.6"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.uv]
+# CPU wheels are enough: every core here is tiny and the tests are shape/grad checks.
+torch-backend = "auto"
