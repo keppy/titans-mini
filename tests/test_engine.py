@@ -132,6 +132,9 @@ def test_one_optimizer_step_trains_both_cores():
             output = engine(target)
             loss = torch.nn.functional.mse_loss(output, target) + engine.last_surprise_loss
             loss.backward()
+            # Every trainable parameter must actually be on a path to the loss.
+            lost = [name for name, p in engine.named_parameters() if p.requires_grad and p.grad is None]
+            assert not lost, f"{core_type}: parameters with no gradient: {lost}"
             optimizer.step()
             losses.append(loss.detach().item())
 

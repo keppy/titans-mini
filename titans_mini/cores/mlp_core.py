@@ -38,6 +38,11 @@ from torch.func import functional_call
 
 from ..core import MemoryCore, per_sequence_mse, register_memory_core
 
+# The template's operands, and therefore the memory's own keys. Named explicitly so
+# that adding a buffer to DynamicMLP cannot silently add memory state: see
+# `MLPMemoryCore.init_memory_state`.
+_MEMORY_OPERANDS = ("weight_in", "bias_in", "weight_out", "bias_out")
+
 
 class DynamicMLP(nn.Module):
     """A two-layer MLP whose weights are supplied per call, not owned.
@@ -106,6 +111,11 @@ class MLPMemoryCore(MemoryCore):
         """Per-sequence copy of the template MLP, `[B, ...]`-shaped."""
         state: dict[str, Tensor] = {}
         for name, template in self.mlp.named_buffers():
+            if name not in _MEMORY_OPERANDS:
+                # The memory's shapes are read off the template, so any buffer added
+                # to DynamicMLP would silently become memory state. Fail loudly
+                # instead: this is the one place where that coupling is checked.
+                raise RuntimeError(f"unexpected template operand {name!r}; expected {_MEMORY_OPERANDS}")
             template = template.detach().to(device=device, dtype=dtype)
             state[name] = template.unsqueeze(0).expand(batch_size, *template.shape).clone()
         return state
@@ -127,15 +137,21 @@ class MLPMemoryCore(MemoryCore):
         comparable between cores and readable at the scale of the values.
         """
 
-        def per_sequence_errors(weights: dict[str, Tensor]) -> Tensor:
-            prediction = functional_call(self.mlp, weights, (key_t,))
-            return per_sequence_mse(prediction, value_t)
+        def total_and_errors(weights: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+            """`(sum of per-sequence errors, the errors themselves)` — one forward pass.
 
-        surprise = per_sequence_errors(memory_state).mean()
+            The scalar is what the step is derived from; the vector is what we report.
+            Splitting them this way (rather than recomputing) is why a step costs one
+            forward, one backward, and nothing else.
+            """
+            errors = per_sequence_mse(functional_call(self.mlp, weights, (key_t,)), value_t)
+            return errors.sum(), errors
+
         # Gradients are taken *with respect to a pytree*, so the result is a dict
         # with the same keys and the same per-sequence shapes. Taking them via
         # torch.func leaves the module and the outer graph untouched.
-        grads = torch.func.grad(lambda weights: per_sequence_errors(weights).sum())(memory_state)
+        grads, errors = torch.func.grad(total_and_errors, has_aux=True)(memory_state)
+        surprise = errors.mean()
         # The step is *defined* by a derivative taken inside it, and that derivative
         # is treated as a constant: the update is a state transition, not a node the
         # outer backward pass descends through. Two reasons, both load-bearing.

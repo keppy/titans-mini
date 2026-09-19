@@ -109,7 +109,8 @@ and asserts the key set does not change with batch or sequence length.
 
 Generated weights are scaled by `1/sqrt(d_model)` on the way into the virtual layer.
 Without it the pre-activation of a square layer grows with `d_model` and saturates
-the GeLU; this is a stability constant, not a learned one.
+the GeLU; this is a stability constant, not a learned one. It is one of the three
+documented deviations from the spec's literal formulas — see below.
 
 ## `detach_memory` — the flag that decides whether the mutator can learn
 
@@ -117,12 +118,30 @@ Default `False`: the graph is kept across steps, so the outer loss reaches
 `state_mutator` through the memory chain. That is what trains the update rule — its
 only path to the loss *is* the stream — and it is the capability Option A does not
 have. Set it `True` for O(1) memory and no BPTT through the chain; then
-`state_mutator` receives no gradient at all while `hyper_net` still does (both
-behaviours are pinned by tests, so the tradeoff can't silently change).
+`state_mutator` **and `memory_norm`** receive no gradient at all (the mutation path is
+their only route to the loss) while `hyper_net` still does, since the read stays live.
+Both parameters stay registered and still appear in `parameters()`; they simply stop
+being trained, which is the documented cost of the flag and is pinned by tests.
 
 For Option A the flag is a no-op — its step is already a state transition — and
 `test_detach_memory_is_a_noop_for_the_mlp_core` asserts that with equal forward
 values *and* equal outer gradients rather than trusting the claim.
+
+## Deviations from the specification text
+
+Three, each deliberate and each visible in one place:
+
+1. **Option B scales the generated weights, not the generated bias.**
+   `_dynamic_weights` multiplies `W_temp` by `1/sqrt(d_model)` before the virtual layer;
+   the spec-literal `GeLU(query @ W_temp + B_temp)` holds only with that scale applied to
+   `W_temp` and not to `B_temp` (`B_temp` comes back from `hyper_net` raw). Without the
+   scale the pre-activation of a square layer grows with `d_model` and saturates the GeLU.
+2. **The engine's output is `out_proj(retrieved) + x_t`, not the raw accumulated
+   retrievals.** The residual keeps the engine stackable; the projection gives the
+   retrieved value a learned readout. Both are additions to the spec's "accumulate the
+   retrieved tokens into a buffer", and both are the same shape as the spec's output.
+3. **Option A's inner gradient is detached before the step** — the memory transition is
+   a state transition, not a node on the outer graph; see the Option A section above.
 
 ## Running it
 

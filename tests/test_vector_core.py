@@ -123,7 +123,10 @@ def test_detach_memory_cuts_the_chain_but_still_trains_the_hyper_net():
     (output.sum() + engine.last_surprise_loss).backward()
 
     grads = {name: param.grad for name, param in engine.memory_core.named_parameters()}
-    assert all(grad is None for name, grad in grads.items() if name.startswith("state_mutator"))
+    assert all(grad is None for name, grad in grads.items() if name.startswith(("state_mutator", "memory_norm")))
     assert all(grad is not None for name, grad in grads.items() if name.startswith("hyper_net"))
+    # The readout normalisation is static and still registered — it simply has no path
+    # to the loss once the chain is cut, which is the documented cost of the flag.
+    assert all(isinstance(p, nn.Parameter) for name, p in engine.memory_core.named_parameters() if name.startswith("memory_norm"))
     # The retrieval path is still live where it matters: memory read -> output.
     assert engine.to_qkv.weight.grad is not None
