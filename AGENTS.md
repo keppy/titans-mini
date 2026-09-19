@@ -53,13 +53,23 @@ interface between the engine and a core is the thing that must stay narrow:
   on a near-zero memory gives std ≈ `sqrt(var/(var+eps))` ≈ 0.93, not 1.0. Not a bug;
   don't "fix" it by loosening a test into meaninglessness — assert the layer norm
   relation itself.
-- **`functional_call` binds by name and by shape.** The template module's parameter
-  shapes are the *memory state's* shapes minus the batch dimension, and the forward
-  pass must use explicit `einsum` (batched weights + `F.linear` do not mean what they
-  look like).
+- **`functional_call` binds by name and by shape.** The template module's operand shapes
+  are the *memory state's* shapes minus the batch dimension, and the forward pass must use
+  explicit `einsum` (batched weights + `F.linear` do not mean what they look like).
 - **A read is only a graph node if one of its inputs requires grad.** A detached
   memory state plus a plain query silently produces a constant. Tests that assert
   gradient flow must feed `requires_grad=True` inputs, as the engine's projections do.
+- **`torch.func.grad` does not return constants on this torch.** In 2.14 the returned
+  gradients carry a graph (`grad_fn` set, `requires_grad=True`), so an "inner step" that
+  looks like a state transition is silently differentiable-through unless you detach the
+  gradients. Option A detaches for that reason; leaving it in costs a second-order graph
+  over the whole sequence and lets the outer loss meta-learn the update rule. Assert the
+  cut (`test_inner_step_is_a_state_transition_not_a_graph_node`), never assume it.
+- **Anything kept out of the checkpoint must be deterministic.** Option A's template
+  buffers are deliberately not in `state_dict()`, so they are drawn from a local generator
+  seeded by a constant rather than the global RNG — otherwise a checkpoint reloaded into a
+  fresh engine produces different outputs (`maxdiff` 0.24) and the reproducibility story
+  is a lie. `test_checkpoint_round_trip_reproduces_outputs` catches the relapse.
 - **Every core takes the same construction arguments** (`d_model`, `d_mem_vector`,
   `hidden_dim`) even where one is unused — that uniformity is what lets the engine
   build any core from one config.
