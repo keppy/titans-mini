@@ -25,7 +25,7 @@ class TitansConfig:
     hidden_dim: int = 256
     # Cut the graph at every memory-state transition. False (default) lets the
     # outer loss reach Option B's state_mutator through the stream, which is what
-    # trains the update rule; True is the O(1)-memory, no-BPTT setting. It has no
-    # effect on Option A, whose gradient-descent update drops the path by
-    # construction. See cores/mlp_core.py for that argument.
+    # trains the update rule; True is the O(1)-memory, no-BPTT setting. It is a
+    # no-op for Option A, whose inner gradient-descent step is a state transition by
+    # construction — that equality is asserted in the tests rather than assumed.
     detach_memory: bool = False

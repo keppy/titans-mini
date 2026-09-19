@@ -79,6 +79,39 @@ def test_swapping_the_core_is_the_only_difference(core_type):
     assert mlp_keys != vector_keys
 
 
+@pytest.mark.parametrize("core_type", ["MLP", "Vector"])
+def test_checkpoint_round_trip_reproduces_outputs(core_type):
+    """A fresh engine that loads a checkpoint must reproduce it bit for bit.
+
+    This is what pins the MLP core's template to a fixed initialization: the template
+    is deliberately not checkpointed, so if it were drawn from the global RNG instead,
+    this would drift silently.
+    """
+    source = ModularTitansEngine(core_type, **ENGINE_KWARGS)
+    x = torch.randn(BATCH, SEQ, D_MODEL)
+    expected = source(x)
+
+    restored = ModularTitansEngine(core_type, **ENGINE_KWARGS)
+    restored.load_state_dict(source.state_dict())
+
+    assert torch.equal(restored(x), expected)
+
+
+def test_detach_memory_is_a_noop_for_the_mlp_core():
+    """Option A's step is a state transition either way; assert it, don't assume it."""
+    keep = ModularTitansEngine("MLP", detach_memory=False, **ENGINE_KWARGS)
+    cut = ModularTitansEngine("MLP", detach_memory=True, **ENGINE_KWARGS)
+    cut.load_state_dict(keep.state_dict())
+
+    x = torch.randn(BATCH, SEQ, D_MODEL)
+    kept, cut_output = keep(x), cut(x)
+    assert torch.equal(kept, cut_output)
+
+    grad_kept = torch.autograd.grad(kept.pow(2).mean(), keep.to_qkv.weight)[0]
+    grad_cut = torch.autograd.grad(cut_output.pow(2).mean(), cut.to_qkv.weight)[0]
+    assert torch.equal(grad_kept, grad_cut)
+
+
 def test_inner_lr_is_a_hyperparameter_not_a_trained_parameter():
     engine = ModularTitansEngine("Vector", **ENGINE_KWARGS)
     assert engine.inner_lr == 0.05

@@ -15,15 +15,17 @@ Two things make this work rather than silently detaching the outer graph:
    gradients, then applies `w - lr * g` as plain tensor arithmetic. No `.backward()`
    is called on the surprise loss, no optimizer object owns the weights, and no
    `.data`/`.detach_()` trickery is involved — the outer graph is never touched.
-   `torch.func.grad` returns constants (its own graph is not kept), so the GD step
-   is a state transition, not part of the outer backward pass. That matches the
-   architecture: the memory update is applied to state, and the *surprise loss* is
-   the separate signal a caller backpropagates if it wants the update to improve.
+   The gradients are detached explicitly before the step, so the update is a state
+   transition rather than a node the outer backward pass can descend through; see
+   the comment in `update` for why that is both the architecture's semantics and
+   the only version whose cost is flat in sequence length.
 
-The direct consequence, worth stating because it is the difference between the two
-options: Option A cannot send gradient from the outer loss back into its own update
-step — the update is defined by a derivative we take inside the step, so the chain
-through memory is cut by construction. Option B can. That is the experiment.
+The result for the outer graph, stated precisely, because the loose version of this
+sentence was wrong once: a read is differentiable in the stream query (and in the
+weights), so the outer loss flows through retrieval into the engine's projections —
+that is the invariant the tests pin. The outer loss does **not** flow through the
+inner update into the next step's memory. Option B is the option that can do that
+(and only while `detach_memory=False`), which is exactly the comparison.
 """
 
 from __future__ import annotations
@@ -49,9 +51,16 @@ class DynamicMLP(nn.Module):
     persistent state — a checkpoint has no business carrying a template. They exist
     only so that `functional_call` has names, shapes and an initialization to bind
     over; their values are replaced on every call and never read at runtime.
+
+    Because they are not checkpointed, their values must be a *fixed function of the
+    shapes*, and so they are drawn from a local generator rather than the global RNG:
+    a fresh process, a second engine, and an engine that just loaded a checkpoint all
+    start the memory from the same point, and constructing a core does not perturb the
+    global stream. A random template would have made runs irreproducible while looking
+    harmless.
     """
 
-    def __init__(self, d_in: int, d_hidden: int, d_out: int) -> None:
+    def __init__(self, d_in: int, d_hidden: int, d_out: int, *, init_seed: int = 0) -> None:
         super().__init__()
         self.register_buffer("weight_in", torch.empty(d_in, d_hidden), persistent=False)
         self.register_buffer("bias_in", torch.zeros(d_hidden), persistent=False)
@@ -61,8 +70,10 @@ class DynamicMLP(nn.Module):
         # assumes [out, in], and these weight matrices are stored [in, out].
         bound_in = 1.0 / math.sqrt(d_in)
         bound_out = 1.0 / math.sqrt(d_hidden)
-        nn.init.uniform_(self.weight_in, -bound_in, bound_in)
-        nn.init.uniform_(self.weight_out, -bound_out, bound_out)
+        generator = torch.Generator(device="cpu").manual_seed(init_seed)
+        with torch.no_grad():
+            self.weight_in.uniform_(-bound_in, bound_in, generator=generator)
+            self.weight_out.uniform_(-bound_out, bound_out, generator=generator)
 
     def forward(self, x: Tensor) -> Tensor:
         """`x` is `[B, d_in]`; weights are `[B, ...]`-shaped, yielding `[B, d_out]`."""
@@ -125,5 +136,19 @@ class MLPMemoryCore(MemoryCore):
         # with the same keys and the same per-sequence shapes. Taking them via
         # torch.func leaves the module and the outer graph untouched.
         grads = torch.func.grad(lambda weights: per_sequence_errors(weights).sum())(memory_state)
-        new_state = {name: weight - inner_lr * grads[name] for name, weight in memory_state.items()}
+        # The step is *defined* by a derivative taken inside it, and that derivative
+        # is treated as a constant: the update is a state transition, not a node the
+        # outer backward pass descends through. Two reasons, both load-bearing.
+        #
+        # (1) It is what the architecture says. The memory evolves by its own
+        #     gradient descent; the differentiable signal for learning the
+        #     projections is the surprise loss returned alongside it, not this step.
+        # (2) It is not free to leave in. In torch 2.14 `torch.func.grad` returns
+        #     gradients that still carry a graph (verified: they come back with
+        #     `grad_fn` set), so the memory would accumulate a second-order graph
+        #     across the sequence — a 512-step forward stops being O(1) in seq_len,
+        #     and the outer loss quietly starts meta-learning the update rule.
+        new_state = {
+            name: weight - inner_lr * grads[name].detach() for name, weight in memory_state.items()
+        }
         return new_state, surprise

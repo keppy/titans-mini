@@ -29,6 +29,45 @@ def test_memory_state_is_a_per_sequence_weight_dict():
         assert tensor is not template  # a copy, not the module's tensor
 
 
+def test_inner_step_is_a_state_transition_not_a_graph_node():
+    """The update must not be descendable by the outer backward pass.
+
+    torch 2.14's `torch.func.grad` hands back gradients that still carry a graph, so
+    this is the assertion that the explicit detach is doing its job: the memory state
+    after a step is data, even when the key and value it was written from are not.
+    """
+    core = make_core()
+    state = core.init_memory_state(BATCH)
+    key = torch.randn(BATCH, D_MODEL, requires_grad=True)
+    value = torch.randn(BATCH, D_MODEL, requires_grad=True)
+
+    new_state, surprise = core.update(state, key, value, INNER_LR)
+
+    assert all(not tensor.requires_grad for tensor in new_state.values())
+    # A scalar built from the new state has nothing to descend into it at all.
+    downstream = sum(tensor.pow(2).sum() for tensor in new_state.values())
+    assert not downstream.requires_grad
+    assert not new_state["weight_in"].requires_grad  # and not via the identity path
+    # The surprise, by contrast, is the differentiable signal by design.
+    assert surprise.requires_grad
+    assert torch.autograd.grad(surprise, key)[0].abs().sum() > 0
+
+
+def test_template_initialization_is_deterministic_and_leaves_the_global_rng_alone():
+    """Not checkpointed, so it must not depend on the process's random state."""
+    torch.manual_seed(1234)
+    first = make_core()
+    torch.manual_seed(999)  # a different global stream entirely
+    second = make_core()
+
+    for (name, left), (_, right) in zip(first.mlp.named_buffers(), second.mlp.named_buffers()):
+        assert torch.equal(left, right), name
+
+    before = torch.get_rng_state()
+    make_core()
+    assert torch.equal(before, torch.get_rng_state()), "constructing a core consumed global RNG"
+
+
 def test_template_is_neither_a_parameter_nor_checkpointed_state():
     """The template must be invisible to optimizers and to a checkpoint."""
     core = make_core()

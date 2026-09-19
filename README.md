@@ -12,7 +12,7 @@ titans_mini/
   engine.py            ModularTitansEngine: the one loop over time
   cores/mlp_core.py    Option A — memory is the weights of a 2-layer MLP
   cores/vector_core.py Option B — memory is a flat vector, weights are generated from it
-tests/                 21 tests: shapes, state layout, and every autograd claim below
+tests/                 26 tests: shapes, state layout, and every autograd claim below
 scripts/smoke_train.py both cores end to end at spec scale
 ```
 
@@ -65,14 +65,29 @@ not persistent state (no checkpoint carries them). `test_template_is_neither_a_p
 is the assertion of that, alongside
 `test_template_module_is_never_in_the_graph_or_updated`.
 
+Because they are not checkpointed, the template's values are a fixed function of its
+shapes (a local generator, not the global RNG): a fresh process, a second engine, and
+an engine that just loaded a checkpoint all start the memory from the same point, and
+constructing a core does not perturb the global stream.
+`test_template_initialization_is_deterministic_and_leaves_the_global_rng_alone` and
+`test_checkpoint_round_trip_reproduces_outputs` pin that.
+
 Every op is an explicit `einsum` so the leading batch dimension of the dynamic weights
 is honoured — these are per-sequence memories, not one shared MLP.
 
-Consequence worth stating, because it is the difference between the options: **A
-cannot send outer gradient into its own update step.** The step is defined by a
-derivative taken inside it, so the chain through memory is cut by construction.
+Consequence worth stating, because it is the difference between the options: **A cannot
+send outer gradient into its own update step.** The step is defined by a derivative
+taken inside it, and that derivative is detached before the weights move, so the
+memory transition is data rather than a node the backward pass can descend through.
+That detach is load-bearing, not decoration: `torch.func.grad` in torch 2.14 returns
+gradients that *still carry a graph* (they come back with `grad_fn` set), so without it
+the memory would accumulate a second-order graph across the sequence and the outer loss
+would quietly start meta-learning the update rule — a 512-step forward stops being
+O(1) in `seq_len`. `test_inner_step_is_a_state_transition_not_a_graph_node` pins it.
+
 `inner_lr` per sequence is exactly the spec's `w - inner_lr * grad(w)`; the scalar
-`surprise` reported is the batch mean of the same per-sequence errors.
+`surprise` reported is the batch mean of the same per-sequence errors, and it is the
+differentiable signal by design.
 
 ## Option B — vector memory ("data-as-parameters")
 
@@ -105,11 +120,15 @@ have. Set it `True` for O(1) memory and no BPTT through the chain; then
 `state_mutator` receives no gradient at all while `hyper_net` still does (both
 behaviours are pinned by tests, so the tradeoff can't silently change).
 
+For Option A the flag is a no-op — its step is already a state transition — and
+`test_detach_memory_is_a_noop_for_the_mlp_core` asserts that with equal forward
+values *and* equal outer gradients rather than trusting the claim.
+
 ## Running it
 
 ```bash
 uv sync
-.venv/Scripts/python.exe -m pytest -q            # 20 tests, CPU, ~6s
+.venv/Scripts/python.exe -m pytest -q            # 26 tests, CPU, ~3s
 .venv/Scripts/python.exe scripts/smoke_train.py  # both cores at spec scale, random tokens
 ```
 
